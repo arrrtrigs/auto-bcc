@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto BCC for Gmail
 // @namespace    https://github.com/arrrtrigs/auto-bcc
-// @version      1.3.0
+// @version      1.4.0
 // @description  Automatically adds Cc/Bcc addresses to Gmail messages based on the From account.
 // @author       You
 // @match        https://mail.google.com/*
@@ -20,7 +20,8 @@
  * raise @version above (1.3.0 → 1.3.1). If the number doesn't go up, nobody
  * gets the update.
  *
- * Open settings: Tampermonkey icon → "Auto BCC settings" (while Gmail is open).
+ * Open settings: click the floating envelope button in Gmail, or
+ * Tampermonkey icon → "Auto BCC settings" (while Gmail is open).
  */
 (() => {
   const DEFAULTS = {
@@ -50,6 +51,7 @@
   function loadSettings() {
     settings = Object.assign({}, DEFAULTS, GM_getValue("settings", DEFAULTS));
     log("Settings loaded:", settings);
+    if (typeof updateFab === "function") updateFab();
     composes.forEach((st, root) => { st.lastKey = null; sync(root, st); });
   }
   function saveSettings(s) {
@@ -587,11 +589,165 @@
     dirty = false;
   }
 
+  // ======================================================================
+  // Floating button
+  // Click: open the rules. Drag: move it anywhere (position is remembered).
+  // Right-click: turn Auto BCC on/off.
+  // ======================================================================
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const svg = (tag, attrs = {}, ...kids) => {
+    const el = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    kids.forEach((c) => el.append(c));
+    return el;
+  };
+
+  const FAB_CSS = `
+    :host { all: initial; }
+    .fab {
+      position: fixed; z-index: 2147482000; width: 44px; height: 44px; border-radius: 50%;
+      border: none; padding: 0; cursor: pointer; touch-action: none; user-select: none;
+      display: grid; place-items: center; color: #fff; background: #2f7d62;
+      box-shadow: 0 2px 6px rgba(0,0,0,.25), 0 6px 16px rgba(0,0,0,.15);
+      transition: transform .15s ease, background .15s ease, box-shadow .15s ease;
+    }
+    .fab:hover { transform: scale(1.07); box-shadow: 0 3px 8px rgba(0,0,0,.3), 0 8px 22px rgba(0,0,0,.18); }
+    .fab:focus-visible { outline: 3px solid #9fd9c3; outline-offset: 2px; }
+    .fab.off { background: #7b8784; }
+    .fab.dragging { cursor: grabbing; transform: scale(1.1); transition: none; }
+    .dot { position: absolute; top: 3px; right: 3px; width: 11px; height: 11px; border-radius: 50%;
+      background: #4ade80; border: 2px solid #fff; }
+    .fab.off .dot { background: #e5e7eb; }
+    .tip {
+      position: fixed; z-index: 2147482001; pointer-events: none; white-space: nowrap;
+      background: #1f2a28; color: #fff; font: 12px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      padding: 6px 9px; border-radius: 6px; opacity: 0; transition: opacity .12s ease;
+    }
+    .tip.show { opacity: 1; }
+    @media (prefers-reduced-motion: reduce) { .fab { transition: none; } }
+  `;
+
+  let fabHost = null, fabBtn = null, fabTip = null;
+
+  function updateFab() {
+    if (!fabBtn) return;
+    const on = settings.enabled !== false;
+    fabBtn.classList.toggle("off", !on);
+    const label = `Auto BCC is ${on ? "on" : "off"}. Click to edit rules, right-click to turn ${on ? "off" : "on"}, drag to move.`;
+    fabBtn.setAttribute("aria-label", label);
+    if (fabTip) fabTip.textContent = on ? "Auto BCC rules" : "Auto BCC (off)";
+  }
+
+  function placeFab(pos) {
+    const size = 44, m = 8;
+    const x = Math.min(Math.max(m, pos.x), window.innerWidth - size - m);
+    const y = Math.min(Math.max(m, pos.y), window.innerHeight - size - m);
+    fabBtn.style.left = x + "px";
+    fabBtn.style.top = y + "px";
+    return { x, y };
+  }
+
+  function showTip(show) {
+    if (!show) return fabTip.classList.remove("show");
+    const r = fabBtn.getBoundingClientRect();
+    fabTip.classList.add("show");
+    const w = fabTip.offsetWidth;
+    // Put the tooltip on whichever side has room.
+    const left = r.left > w + 16 ? r.left - w - 8 : r.right + 8;
+    fabTip.style.left = left + "px";
+    fabTip.style.top = r.top + r.height / 2 - fabTip.offsetHeight / 2 + "px";
+  }
+
+  function createFab() {
+    if (fabHost || GM_getValue("fabHidden", false)) return;
+    fabHost = h("div", { id: "auto-bcc-fab" });
+    const shadow = fabHost.attachShadow({ mode: "open" });
+    shadow.append(h("style", {}, FAB_CSS));
+
+    // Envelope with a small "+" person-badge: "adds a recipient".
+    const icon = svg("svg", { width: "22", height: "22", viewBox: "0 0 24 24", fill: "none",
+        stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true" },
+      svg("rect", { x: "2.5", y: "5", width: "15", height: "11.5", rx: "2" }),
+      svg("path", { d: "M3 6.5l7 5 7-5" }),
+      svg("path", { d: "M20 14v6M17 17h6" }));
+
+    fabBtn = h("button", { class: "fab", type: "button" }, icon, h("span", { class: "dot" }));
+    fabTip = h("div", { class: "tip", role: "presentation" });
+    shadow.append(fabBtn, fabTip);
+    document.body.append(fabHost);
+
+    // Default spot: lower-left, above Gmail's bottom bar and clear of compose windows (bottom-right).
+    let pos = GM_getValue("fabPos", null) || { x: 20, y: window.innerHeight - 120 };
+    pos = placeFab(pos);
+    updateFab();
+
+    // Click vs. drag.
+    let start = null, moved = false;
+    fabBtn.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      start = { px: e.clientX, py: e.clientY, x: pos.x, y: pos.y };
+      moved = false;
+      fabBtn.setPointerCapture(e.pointerId);
+    });
+    fabBtn.addEventListener("pointermove", (e) => {
+      if (!start) return;
+      const dx = e.clientX - start.px, dy = e.clientY - start.py;
+      if (!moved && Math.hypot(dx, dy) < 5) return;
+      moved = true;
+      fabBtn.classList.add("dragging");
+      showTip(false);
+      pos = placeFab({ x: start.x + dx, y: start.y + dy });
+    });
+    fabBtn.addEventListener("pointerup", () => {
+      if (!start) return;
+      fabBtn.classList.remove("dragging");
+      if (moved) GM_setValue("fabPos", pos);
+      start = null;
+    });
+    fabBtn.addEventListener("click", (e) => {
+      if (moved) { moved = false; e.preventDefault(); return; }
+      showTip(false);
+      openSettings();
+    });
+    fabBtn.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      saveSettings({ ...settings, enabled: !settings.enabled });
+      showTip(true);
+      setTimeout(() => showTip(false), 1500);
+    });
+    fabBtn.addEventListener("mouseenter", () => showTip(true));
+    fabBtn.addEventListener("mouseleave", () => showTip(false));
+    fabBtn.addEventListener("focus", () => showTip(true));
+    fabBtn.addEventListener("blur", () => showTip(false));
+    // Keep Gmail's keyboard shortcuts from reacting to keys pressed on the button.
+    for (const t of ["keydown", "keypress", "keyup"]) fabHost.addEventListener(t, (e) => e.stopPropagation());
+
+    // Stay on screen when the window is resized.
+    window.addEventListener("resize", () => { if (fabBtn) pos = placeFab(pos); });
+  }
+
+  function removeFab() {
+    if (fabHost) fabHost.remove();
+    fabHost = fabBtn = fabTip = null;
+  }
+
+  // ---------- Tampermonkey menu ----------
   GM_registerMenuCommand("Auto BCC settings", openSettings);
   GM_registerMenuCommand("Turn Auto BCC on/off", () => {
     saveSettings({ ...settings, enabled: !settings.enabled });
     alert("Auto BCC is now " + (settings.enabled ? "ON" : "OFF"));
   });
+  GM_registerMenuCommand("Show/hide floating button", () => {
+    const hidden = !GM_getValue("fabHidden", false);
+    GM_setValue("fabHidden", hidden);
+    hidden ? removeFab() : createFab();
+  });
+  GM_registerMenuCommand("Reset floating button position", () => {
+    GM_setValue("fabPos", null);
+    removeFab();
+    createFab();
+  });
 
   loadSettings();
+  createFab();
 })();
