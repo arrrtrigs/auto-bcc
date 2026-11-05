@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto BCC for Gmail
 // @namespace    https://github.com/arrrtrigs/auto-bcc
-// @version      1.4.0
+// @version      1.4.1
 // @description  Automatically adds Cc/Bcc addresses to Gmail messages based on the From account.
 // @author       You
 // @match        https://mail.google.com/*
@@ -32,8 +32,8 @@
   const SEL = {
     body: 'div[role="textbox"][aria-label*="Message Body"], div[contenteditable="true"][g_editable="true"]',
     sendButton: 'div[role="button"][data-tooltip^="Send"], div[role="button"][aria-label^="Send"]',
-    recipientInputs: 'input[aria-label*="recipients" i], textarea[name="to"], textarea[name="cc"], textarea[name="bcc"], input[name="to"]:not([type="hidden"]), input[name="cc"]:not([type="hidden"]), input[name="bcc"]:not([type="hidden"])',
-    toggles: 'span[role="link"], div[role="link"], span[data-tooltip], [aria-label^="Add Cc" i], [aria-label^="Add Bcc" i]',
+    recipientInputs: 'input[peoplekit-id], input[aria-label*="recipients" i], textarea[name="to"], textarea[name="cc"], textarea[name="bcc"], input[name="to"]:not([type="hidden"]), input[name="cc"]:not([type="hidden"]), input[name="bcc"]:not([type="hidden"])',
+    toggles: 'span[role="link"], div[role="link"], span[data-tooltip], [aria-label*="cc" i][tabindex]',
     chip: '[email], [data-hovercard-id]'
   };
 
@@ -74,22 +74,25 @@
   }
 
   // Which recipient field is this input: "to", "cc" or "bcc"?
-  function kindOf(input) {
+  function kindOf(input, root) {
     const name = norm(input.getAttribute("name"));
     if (["to", "cc", "bcc"].includes(name)) return name;
-    const label = norm(input.getAttribute("aria-label"));
-    if (/^bcc\b/.test(label)) return "bcc";
-    if (/^cc\b/.test(label)) return "cc";
-    if (/^to\b/.test(label)) return "to";
+    const label = norm(input.getAttribute("aria-label")).replace(/[\u200e\u200f\u202a-\u202e]/g, "");
+    // English plus common translations (Bcc = CCO / CCI / BCC, To = Para / À / An / Aan / Kay).
+    if (/\b(bcc|cco|cci|bkp)\b/.test(label)) return "bcc";
+    if (/\bcc\b/.test(label)) return "cc";
+    if (/^(to|para|à|a|an|aan|kay)\b/.test(label)) return "to";
+    // Last resort: Gmail always lays the rows out as To, Cc, Bcc.
+    const r = root || input.closest("form, [role='dialog'], table") || document;
+    const all = [...new Set(r.querySelectorAll(SEL.recipientInputs))];
+    if (all.length === 3) return ["to", "cc", "bcc"][all.indexOf(input)] || "";
     return "";
   }
 
   function findInput(root, kind) {
-    return [...root.querySelectorAll(SEL.recipientInputs)].find((i) => kindOf(i) === kind && visible(i)) || null;
+    return [...root.querySelectorAll(SEL.recipientInputs)].find((i) => kindOf(i, root) === kind && visible(i)) || null;
   }
 
-  // The container for one recipient row (the input plus its chips), stopping before
-  // we reach an ancestor that also holds another row's input.
   function rowOf(input) {
     let el = input;
     while (el.parentElement) {
@@ -110,7 +113,7 @@
   function allRecipients(root) {
     const set = new Set();
     for (const k of ["to", "cc", "bcc"]) {
-      const inp = [...root.querySelectorAll(SEL.recipientInputs)].find((i) => kindOf(i) === k);
+      const inp = [...root.querySelectorAll(SEL.recipientInputs)].find((i) => kindOf(i, root) === k);
       if (inp) chipsIn(rowOf(inp)).forEach((c) => set.add(c.email));
     }
     return [...set];
@@ -193,23 +196,33 @@
     return null;
   }
 
+  // The "Cc" / "Bcc" links. Gmail HIDES them when the recipients area is
+  // collapsed (cursor in the body or subject), so we don't require them to be
+  // visible: a hidden element still responds to a dispatched click.
   function findToggle(root, kind) {
-    const re = kind === "bcc" ? /^(add\s+)?bcc\b/i : /^(add\s+)?cc\b/i;
-    return [...root.querySelectorAll(SEL.toggles)].find((t) =>
-      visible(t) &&
-      re.test((t.getAttribute("aria-label") || t.getAttribute("data-tooltip") || t.textContent || "").trim()));
+    const clean = (x) => (x || "").replace(/[\u200e\u200f\u202a-\u202e]/g, "").trim();
+    const shortcut = kind === "bcc" ? /ctrl-[^-\s]+-b\b|shift[-+ ]?b\b|⇧\s*b\b/i : /ctrl-[^-\s]+-c\b|shift[-+ ]?c\b|⇧\s*c\b/i;
+    const word = kind === "bcc" ? /^(add\s+)?(bcc|cco|cci|bkp)\b/i : /^(add\s+)?cc\b/i;
+    const textExact = kind === "bcc" ? /^(bcc|cco|cci|bkp)$/i : /^cc$/i;
+    const cands = [...root.querySelectorAll(SEL.toggles)].filter((t) => !t.querySelector("input"));
+    return cands.find((t) => {
+      const aria = clean(t.getAttribute("aria-label")), tip = clean(t.getAttribute("data-tooltip"));
+      return shortcut.test(aria) || shortcut.test(tip) || word.test(aria) || word.test(tip) ||
+             textExact.test(clean(t.textContent));
+    }) || null;
   }
 
-  // Replies start with the recipients collapsed into one summary line
-  // ("To: someone"); the Cc/Bcc links only exist after it is expanded.
+  // When the cursor is in the body, Gmail folds To/Cc/Bcc into one line
+  // ("Recipients" or "To: name"). Clicking it unfolds the rows and the links.
   function expandRecipients(root) {
-    const to = [...root.querySelectorAll(SEL.recipientInputs)].find((i) => kindOf(i) === "to");
-    if (to && visible(to)) { realClick(to); to.focus(); return true; }
-    const summary = [...root.querySelectorAll('[role="button"], [tabindex], span, div')].find((el) =>
-      visible(el) && el.children.length < 6 &&
-      /^(to|recipients)\b/i.test((el.getAttribute("aria-label") || el.textContent || "").trim()) &&
-      !el.querySelector(SEL.body));
-    if (summary) { realClick(summary); return true; }
+    const to = [...root.querySelectorAll(SEL.recipientInputs)].find((i) => kindOf(i, root) === "to");
+    if (to && visible(to)) return false; // already expanded
+    const folded = root.querySelector(".aoD.hl") ||
+      [...root.querySelectorAll("span, div")].find((el) =>
+        visible(el) && el.children.length === 0 &&
+        /^(recipients|to\b|para\b|destinatarios|tatanggap)/i.test(el.textContent.trim()))?.closest("[tabindex]") ;
+    if (folded) { realClick(folded); return true; }
+    if (to) { to.focus(); realClick(to); return true; }
     return false;
   }
 
@@ -217,31 +230,39 @@
     let input = findInput(root, kind);
     if (input) return input;
 
-    // 1) The "Cc" / "Bcc" link.
-    let toggle = findToggle(root, kind);
-    if (!toggle && expandRecipients(root)) { await sleep(250); toggle = findToggle(root, kind); }
+    // 1) Unfold the recipients if they're collapsed.
+    if (expandRecipients(root)) await sleep(250);
+    input = findInput(root, kind);
+    if (input) return input;
+
+    // 2) Click the Cc/Bcc link (visible or not).
+    const toggle = findToggle(root, kind);
     if (toggle) {
       realClick(toggle);
+      if (typeof toggle.click === "function") toggle.click();
       input = await waitForInput(root, kind);
       if (input) return input;
     }
 
-    // 2) Gmail's own shortcut: Ctrl/⌘ + Shift + C (Cc) or B (Bcc), sent to the message body.
-    const body = root.querySelector(SEL.body);
-    if (body) {
-      const mac = /Mac/i.test(navigator.platform);
-      const letter = kind === "bcc" ? "b" : "c";
-      body.focus();
-      body.dispatchEvent(new KeyboardEvent("keydown", {
-        key: letter.toUpperCase(), code: "Key" + letter.toUpperCase(),
-        keyCode: letter.toUpperCase().charCodeAt(0), which: letter.toUpperCase().charCodeAt(0),
-        shiftKey: true, ctrlKey: !mac, metaKey: mac, bubbles: true, cancelable: true
-      }));
-      input = await waitForInput(root, kind, 800);
-      if (input) return input;
-    }
+    // 3) Gmail's shortcut: Ctrl/⌘ + Shift + C (Cc) or B (Bcc).
+    const target = root.querySelector(SEL.body) || root;
+    const mac = /Mac/i.test(navigator.platform);
+    const L = kind === "bcc" ? "B" : "C";
+    target.focus();
+    target.dispatchEvent(new KeyboardEvent("keydown", {
+      key: L.toLowerCase(), code: "Key" + L, keyCode: L.charCodeAt(0), which: L.charCodeAt(0),
+      shiftKey: true, ctrlKey: !mac, metaKey: mac, bubbles: true, cancelable: true
+    }));
+    input = await waitForInput(root, kind, 800);
+    if (input) return input;
 
-    log(`Couldn't open the ${kind.toUpperCase()} field yet. Will retry.`);
+    // Nothing worked: print what we can see so the selectors can be fixed.
+    log(`Couldn't open the ${kind.toUpperCase()} field yet. Will retry. Details:`, {
+      toggleFound: !!toggle,
+      toggle: toggle && { tag: toggle.tagName, aria: toggle.getAttribute("aria-label"), tip: toggle.getAttribute("data-tooltip"), text: toggle.textContent },
+      inputs: [...root.querySelectorAll(SEL.recipientInputs)].map((i) => ({
+        kind: kindOf(i, root), aria: i.getAttribute("aria-label"), name: i.getAttribute("name"), visible: visible(i) }))
+    });
     return null;
   }
 
